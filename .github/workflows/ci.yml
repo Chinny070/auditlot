@@ -39,6 +39,13 @@ jobs:
             ~/.cache/gltest-direct
           key: genvm-sdk-${{ env.GENVM_LINTER_VERSION }}-v0.3.0-rc7
 
+      - name: DIAGNOSTIC -- raw HTTP probe of the release asset
+        run: |
+          url="https://github.com/genlayerlabs/genvm-manager/releases/download/${{ env.GENVM_LINTER_VERSION }}/genvm-universal.tar.xz"
+          echo "probing: $url"
+          curl -sS -I -L -o /tmp/headers.txt -w "final_http_code=%{http_code} redirects=%{num_redirects} url_effective=%{url_effective}\n" "$url" || true
+          cat /tmp/headers.txt
+
       - name: Pre-download genvm-linter's pinned GenVM SDK
         run: genvm-lint download -v ${{ env.GENVM_LINTER_VERSION }}
 
