@@ -14,7 +14,7 @@ env:
   # runner) and keeps both tools reproducible across CI runs. Confirmed
   # against the GitHub releases API that both tags below ship a usable
   # runner-bundle asset before pinning them here.
-  GENVM_LINTER_VERSION: v0.6.0-rc1
+  GENVM_LINTER_VERSION: v0.6.0-rc5
 
 jobs:
   checks:
