@@ -1,4 +1,4 @@
-# v0.1.0
+# v0.2.0
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 from genlayer import *
@@ -12,6 +12,44 @@ from dataclasses import dataclass
 # ---------------------------------------------------------------------------
 # AuditLot: blind semantic batch certification
 # Stable Studionet target: chain 61999
+#
+# v2 fairness redesign. GenLayer's own consensus layer uses an ECVRF-backed
+# seed chain for validator/leader selection, but that seed is a protocol-
+# internal mechanism: it is not exposed by any documented gl.* API and
+# cannot be read from contract code. No verifiable-random-function or
+# randomness-beacon primitive is available to Intelligent Contracts as of
+# this writing. AuditLot's blind sample therefore still depends on a
+# two-party commit/reveal ceremony between the producer and an independent
+# entropy partner -- but v1's scheme was vulnerable to a "last revealer"
+# attack: whichever party happened to reveal second could privately compute
+# the resulting sample from the already-public first reveal plus its own
+# already-known secret, and simply decline to submit its own reveal
+# transaction if it disliked the outcome, forcing abort_non_reveal for free.
+# A producer could also just create a fresh batch for the same manifest and
+# rubric after an unfavorable real result and publish only the favorable
+# certificate.
+#
+# v2 does not claim to eliminate the last-revealer preview; that would
+# require a trusted third randomness source this platform does not expose.
+# Instead it bounds and prices the attack:
+#   - both participants post an equal GEN bond when they commit;
+#   - whichever party fails to reveal after the other one did forfeits its
+#     entire bond to the honest counterparty (see _settle_bonds_on_abort);
+#   - an "assessment" -- the canonical (chain, contract, manifest, rubric)
+#     identity, independent of any single batch attempt -- can only ever
+#     produce ONE resolved (fully sampled and audited) result. Once an
+#     assessment is resolved, no further batch may be created for it, which
+#     makes cherry-picking a favorable result out of several real,
+#     independently-drawn samples structurally impossible, not merely
+#     discouraged;
+#   - an unresolved assessment may be retried after a non-reveal abort, but
+#     only up to MAX_ABORTS_PER_ASSESSMENT times, so a single uncooperative
+#     or briefly-unavailable partner cannot permanently deny service, while
+#     unlimited free re-rolling by a deliberately withholding party is
+#     bounded and priced in forfeited bonds.
+#
+# See docs/SECURITY_MODEL.md for the full, narrowly-qualified fairness
+# claim and an explicit statement of what this design does NOT guarantee.
 # ---------------------------------------------------------------------------
 
 STATUS_OPEN = 0
@@ -39,6 +77,26 @@ MAX_ITEM_COUNT = 10000
 MAX_SAMPLE_SIZE = 25
 MAX_ITEM_ID_LEN = 120
 
+# Minimum GEN bond (in atoms) each participant must post when committing.
+# This is a floor, not a fixed price: the producer chooses the actual bond
+# for a batch by the value it attaches to create_batch, and the entropy
+# partner must match it exactly. A higher bond raises the cost of
+# withholding an unfavorable reveal proportionally; producers auditing
+# higher-stakes batches should post a correspondingly higher bond.
+MIN_BOND_ATOMS = 10**15
+
+# After this many non-reveal aborts for the same (manifest, rubric)
+# assessment, no further batch may be created for it -- it is permanently
+# retired, unresolved. This bounds free re-rolling by a party willing to
+# keep forfeiting bonds, while still tolerating a small number of
+# legitimate failures (an offline or unresponsive, not necessarily
+# malicious, entropy partner) without permanently denying the producer
+# service after a single non-reveal.
+MAX_ABORTS_PER_ASSESSMENT = 3
+
+ROLE_PRODUCER = "producer"
+ROLE_PARTNER = "partner"
+
 ERR_EXPECTED = "EXPECTED"
 ERR_EXTERNAL = "EXTERNAL"
 ERR_LLM = "LLM_ERROR"
@@ -49,6 +107,7 @@ ERR_LLM = "LLM_ERROR"
 class Batch:
     producer: Address
     entropy_partner: Address
+    assessment_id: str
     manifest_url: str
     manifest_sha256: str
     rubric: str
@@ -61,6 +120,8 @@ class Batch:
     item_count: u32
     sample_size: u32
     min_pass_bps: u32
+    bond_atoms: u256
+    bonds_settled: bool
     status: u8
     sample_indices: DynArray[u32]
     seed_sha256: str
@@ -89,11 +150,30 @@ class AuditRecord:
     audited_at: str
 
 
+@allow_storage
+@dataclass
+class Assessment:
+    manifest_sha256: str
+    rubric_sha256: str
+    item_count: u32
+    sample_size: u32
+    min_pass_bps: u32
+    bond_atoms: u256
+    attempt_count: u32
+    abort_count: u32
+    resolved: bool
+    resolved_batch_id: u256
+    active_batch_id: u256
+    created_at: str
+
+
 @gl.contract_interface
 class IAuditLot:
     class View:
         def get_batch(self, batch_id: u256) -> dict: ...
         def get_audit(self, batch_id: u256, sample_slot: u32) -> dict: ...
+        def get_assessment(self, assessment_id: str) -> dict: ...
+        def assessment_id_for(self, manifest_sha256: str, rubric_sha256: str) -> str: ...
         def is_certified(self, batch_id: u256, expected_certificate_sha256: str) -> bool: ...
         def get_certificate(self, batch_id: u256) -> dict: ...
 
@@ -112,6 +192,8 @@ class IAuditLot:
         ) -> u256: ...
         def join_entropy(self, batch_id: u256, partner_commitment: str) -> None: ...
         def reveal_entropy(self, batch_id: u256, secret: str) -> None: ...
+        def abort_non_reveal(self, batch_id: u256) -> None: ...
+        def cancel_unmatched(self, batch_id: u256) -> None: ...
         def audit_sample(self, batch_id: u256, sample_slot: u32) -> None: ...
         def settle(self, batch_id: u256) -> None: ...
 
@@ -169,15 +251,97 @@ def validate_digest(value: str, field: str) -> str:
     return digest
 
 
+_FORBIDDEN_HOSTS = frozenset(
+    {
+        "localhost",
+        "localhost.localdomain",
+        "metadata.google.internal",
+    }
+)
+
+
+def _is_ipv4_literal(host: str) -> bool:
+    parts = host.split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if part == "" or len(part) > 3 or not part.isdigit():
+            return False
+        if int(part) > 255:
+            return False
+    return True
+
+
+def _is_ipv6_literal(host: str) -> bool:
+    if not (host.startswith("[") and host.endswith("]")):
+        return False
+    inner = host[1:-1]
+    if inner == "" or ":" not in inner:
+        return False
+    for char in inner:
+        if char not in "0123456789abcdefABCDEF:":
+            return False
+    return True
+
+
 def validate_url(value: str, field: str = "url") -> str:
+    """Deterministic, contract-level defence-in-depth over the manifest and
+    item URLs. This is intentionally conservative and cannot perform real
+    DNS resolution (that would be non-deterministic and could disagree
+    between validators). It rejects the URL shapes that are cheap and
+    unambiguous to reject syntactically: embedded userinfo/credentials,
+    bare IPv4/IPv6 literal hosts, a curated set of well-known internal/
+    metadata hostnames, and any non-default port. It does NOT and cannot
+    verify that GenVM's own web-fetch sandbox additionally blocks
+    server-side-request-forgery targets, follows redirects safely, or
+    resolves DNS without rebinding; no such runtime guarantee is documented
+    for GenVM as of this writing (see docs/SECURITY_MODEL.md), so none is
+    claimed here. Callers needing stronger guarantees must independently
+    verify their GenVM node's runtime behaviour."""
     url = str(value).strip()
     if len(url) == 0 or len(url) > MAX_URL_LEN:
         raise gl.vm.UserError(f"{ERR_EXPECTED}: {field} must be 1..{MAX_URL_LEN} chars")
     if not url.startswith("https://"):
         raise gl.vm.UserError(f"{ERR_EXPECTED}: {field} must use https")
-    if " " in url or "\\" in url:
+    for bad_char in (" ", "\\", "\t", "\n", "\r"):
+        if bad_char in url:
+            raise gl.vm.UserError(f"{ERR_EXPECTED}: malformed {field}")
+    rest = url[len("https://"):]
+    path_split = rest.find("/")
+    authority = rest if path_split == -1 else rest[:path_split]
+    if authority == "":
         raise gl.vm.UserError(f"{ERR_EXPECTED}: malformed {field}")
+    if "@" in authority:
+        raise gl.vm.UserError(f"{ERR_EXPECTED}: {field} must not contain embedded credentials")
+    if authority.startswith("["):
+        bracket_end = authority.find("]")
+        if bracket_end == -1:
+            raise gl.vm.UserError(f"{ERR_EXPECTED}: malformed {field}")
+        host = authority[: bracket_end + 1]
+        port_part = authority[bracket_end + 1 :]
+    elif ":" in authority:
+        host, _, port_part = authority.rpartition(":")
+        port_part = ":" + port_part
+    else:
+        host = authority
+        port_part = ""
+    if port_part not in ("", ":443"):
+        raise gl.vm.UserError(f"{ERR_EXPECTED}: {field} must use the default https port")
+    if host == "":
+        raise gl.vm.UserError(f"{ERR_EXPECTED}: malformed {field}")
+    lowered_host = host.lower()
+    if lowered_host in _FORBIDDEN_HOSTS or lowered_host.endswith(".local") or lowered_host.endswith(".internal"):
+        raise gl.vm.UserError(f"{ERR_EXPECTED}: {field} host is not permitted")
+    if _is_ipv4_literal(host) or _is_ipv6_literal(lowered_host):
+        raise gl.vm.UserError(f"{ERR_EXPECTED}: {field} must use a DNS hostname, not an IP literal")
     return url
+
+
+_DAYS_IN_MONTH = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
+
+def _is_leap_year(year: int) -> bool:
+    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
 
 
 def validate_deadline(value: str) -> str:
@@ -187,12 +351,20 @@ def validate_deadline(value: str) -> str:
     digits = text[0:4] + text[5:7] + text[8:10] + text[11:13] + text[14:16] + text[17:19]
     if not digits.isdigit():
         raise gl.vm.UserError(f"{ERR_EXPECTED}: malformed reveal_deadline")
+    year = int(text[0:4])
     month = int(text[5:7])
     day = int(text[8:10])
     hour = int(text[11:13])
     minute = int(text[14:16])
     second = int(text[17:19])
-    if not (1 <= month <= 12 and 1 <= day <= 31 and 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+    if not (1 <= month <= 12):
+        raise gl.vm.UserError(f"{ERR_EXPECTED}: malformed reveal_deadline")
+    max_day = _DAYS_IN_MONTH[month - 1]
+    if month == 2 and _is_leap_year(year):
+        max_day = 29
+    if not (1 <= day <= max_day):
+        raise gl.vm.UserError(f"{ERR_EXPECTED}: reveal_deadline is not a valid calendar date")
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
         raise gl.vm.UserError(f"{ERR_EXPECTED}: malformed reveal_deadline")
     return text
 
@@ -211,6 +383,20 @@ def current_datetime() -> str:
     return ""
 
 
+def require_current_datetime() -> str:
+    """Every reveal-deadline decision in this contract must fail closed, not
+    fail open, when the transaction's consensus timestamp is unavailable or
+    malformed. Silently treating a missing timestamp as "the deadline has
+    passed" (the v1 behaviour) would let abort_non_reveal succeed
+    prematurely; silently treating it as "still open" would let join/reveal
+    proceed past a real deadline. Both directions are wrong, so this raises
+    instead."""
+    now = current_datetime()
+    if now == "":
+        raise gl.vm.UserError(f"{ERR_EXTERNAL}: transaction timestamp unavailable")
+    return now
+
+
 def time_key(value: str) -> str:
     # Transaction timestamps may include fractional seconds or an offset.
     # The first 19 characters are the sortable UTC calendar component used by
@@ -226,8 +412,34 @@ def before_or_at_deadline(now: str, deadline: str) -> bool:
     return key != "" and key <= deadline[:19]
 
 
-def commitment_of(secret: str) -> str:
-    return sha256_text("AUDITLOT_V1|" + secret)
+def assessment_id_of(manifest_sha256: str, rubric_sha256: str) -> str:
+    """Canonical identity of an assessment: everything that determines what
+    is being tested (this exact manifest, this exact rubric) on this exact
+    chain and this exact deployed contract instance. Deliberately excludes
+    item_count/sample_size/min_pass_bps so that a producer cannot dodge the
+    single-resolved-result rule by re-submitting the same manifest and
+    rubric under a friendlier sample size or threshold; those parameters are
+    instead locked to whatever the assessment's first batch attempt used
+    (see create_batch)."""
+    return sha256_text(
+        "AUDITLOT_ASSESSMENT_V2|"
+        + str(int(gl.message.chain_id))
+        + "|"
+        + str(gl.message.contract_address)
+        + "|"
+        + manifest_sha256
+        + "|"
+        + rubric_sha256
+    )
+
+
+def commitment_of(secret: str, assessment_id: str, role: str) -> str:
+    """assessment_id already transitively binds chain_id, contract_address,
+    manifest_sha256 and rubric_sha256 (see assessment_id_of); this formula
+    adds the participant role and an explicit protocol-version tag so a
+    commitment computed for one role, assessment, contract, or protocol
+    version can never satisfy verification for another."""
+    return sha256_text("AUDITLOT_COMMIT_V2|" + assessment_id + "|" + role + "|" + secret)
 
 
 def deterministic_sample(seed_sha256: str, item_count: int, sample_size: int) -> list[int]:
@@ -447,6 +659,8 @@ def audit_once(
 class AuditLot(gl.Contract):
     batches: TreeMap[u256, Batch]
     audits: TreeMap[str, AuditRecord]
+    assessments: TreeMap[str, Assessment]
+    used_commitments: TreeMap[str, bool]
     next_batch_id: u256
 
     def __init__(self):
@@ -461,16 +675,46 @@ class AuditLot(gl.Contract):
         return f"{int(batch_id)}:{sample_slot}"
 
     def _deadline_open(self, batch: Batch) -> bool:
-        return before_or_at_deadline(current_datetime(), str(batch.reveal_deadline))
+        return before_or_at_deadline(require_current_datetime(), str(batch.reveal_deadline))
+
+    def _pay(self, to: Address, amount: u256) -> None:
+        if int(amount) <= 0:
+            return
+        gl.get_contract_at(to).emit_transfer(value=u256(int(amount)))
+
+    def _settle_bonds_on_abort(self, batch: Batch, was_matched: bool) -> None:
+        if bool(batch.bonds_settled):
+            return
+        batch.bonds_settled = True
+        bond = batch.bond_atoms
+        if int(bond) <= 0:
+            return
+        if not was_matched:
+            # No entropy partner ever committed a bond; refund the producer.
+            self._pay(batch.producer, bond)
+            return
+        producer_revealed = str(batch.producer_reveal) != ""
+        partner_revealed = str(batch.partner_reveal) != ""
+        # _derive_sample_if_ready clears both reveal fields the moment BOTH
+        # are set and transitions out of MATCHED, so abort_non_reveal (which
+        # only runs while status is still OPEN/MATCHED) can only ever
+        # observe at most one of these as true.
+        if producer_revealed and not partner_revealed:
+            self._pay(batch.producer, u256(int(bond) * 2))
+        elif partner_revealed and not producer_revealed:
+            self._pay(batch.entropy_partner, u256(int(bond) * 2))
+        else:
+            self._pay(batch.producer, bond)
+            self._pay(batch.entropy_partner, bond)
 
     def _derive_sample_if_ready(self, batch_id: u256, batch: Batch) -> None:
         if str(batch.producer_reveal) == "" or str(batch.partner_reveal) == "":
             return
         seed = sha256_text(
-            "AUDITLOT_SEED_V1|"
-            + str(int(batch_id))
+            "AUDITLOT_SEED_V2|"
+            + str(batch.assessment_id)
             + "|"
-            + str(batch.manifest_sha256)
+            + str(int(batch_id))
             + "|"
             + str(batch.producer_reveal)
             + "|"
@@ -496,7 +740,7 @@ class AuditLot(gl.Contract):
             sample_indices=",".join(str(i) for i in indices),
         ).emit()
 
-    @gl.public.write
+    @gl.public.write.payable
     def create_batch(
         self,
         manifest_url: str,
@@ -527,18 +771,64 @@ class AuditLot(gl.Contract):
             raise gl.vm.UserError(f"{ERR_EXPECTED}: min_pass_bps must be 1..10000")
         if entropy_partner == gl.message.sender_address:
             raise gl.vm.UserError(f"{ERR_EXPECTED}: entropy partner must be independent")
-        if not before_or_at_deadline(current_datetime(), reveal_deadline):
+        if not before_or_at_deadline(require_current_datetime(), reveal_deadline):
             raise gl.vm.UserError(f"{ERR_EXPECTED}: reveal deadline must be in the future")
+
+        rubric_sha256 = sha256_text(rubric)
+        bond_atoms = int(gl.message.value)
+        if bond_atoms < MIN_BOND_ATOMS:
+            raise gl.vm.UserError(f"{ERR_EXPECTED}: bond must be at least {MIN_BOND_ATOMS} atoms")
+
+        assessment_id = assessment_id_of(manifest_sha256, rubric_sha256)
+        if producer_commitment in self.used_commitments:
+            raise gl.vm.UserError(f"{ERR_EXPECTED}: commitment already used; every commitment must use a fresh secret")
+
+        assessment = self.assessments.get_or_insert_default(assessment_id)
+        if int(assessment.attempt_count) == 0:
+            assessment.manifest_sha256 = manifest_sha256
+            assessment.rubric_sha256 = rubric_sha256
+            assessment.item_count = u32(count)
+            assessment.sample_size = u32(size)
+            assessment.min_pass_bps = u32(threshold)
+            assessment.bond_atoms = u256(bond_atoms)
+            assessment.resolved = False
+            assessment.resolved_batch_id = u256(0)
+            assessment.active_batch_id = u256(0)
+            assessment.abort_count = u32(0)
+            assessment.created_at = require_current_datetime()
+        else:
+            if bool(assessment.resolved):
+                raise gl.vm.UserError(
+                    f"{ERR_EXPECTED}: this manifest+rubric assessment already produced a resolved result; it cannot be retried"
+                )
+            if int(assessment.abort_count) >= MAX_ABORTS_PER_ASSESSMENT:
+                raise gl.vm.UserError(
+                    f"{ERR_EXPECTED}: assessment permanently retired after {MAX_ABORTS_PER_ASSESSMENT} non-reveal aborts"
+                )
+            if int(assessment.active_batch_id) != 0:
+                raise gl.vm.UserError(f"{ERR_EXPECTED}: this assessment already has an active batch in progress")
+            if (
+                int(assessment.item_count) != count
+                or int(assessment.sample_size) != size
+                or int(assessment.min_pass_bps) != threshold
+                or int(assessment.bond_atoms) != bond_atoms
+            ):
+                raise gl.vm.UserError(
+                    f"{ERR_EXPECTED}: retry must reuse this assessment's locked item_count/sample_size/min_pass_bps/bond"
+                )
+
+        self.used_commitments[producer_commitment] = True
 
         batch_id = self.next_batch_id
         self.next_batch_id = u256(int(self.next_batch_id) + 1)
         batch = self.batches.get_or_insert_default(batch_id)
         batch.producer = gl.message.sender_address
         batch.entropy_partner = entropy_partner
+        batch.assessment_id = assessment_id
         batch.manifest_url = manifest_url
         batch.manifest_sha256 = manifest_sha256
         batch.rubric = rubric
-        batch.rubric_sha256 = sha256_text(rubric)
+        batch.rubric_sha256 = rubric_sha256
         batch.producer_commitment = producer_commitment
         batch.partner_commitment = ""
         batch.producer_reveal = ""
@@ -547,6 +837,8 @@ class AuditLot(gl.Contract):
         batch.item_count = u32(count)
         batch.sample_size = u32(size)
         batch.min_pass_bps = u32(threshold)
+        batch.bond_atoms = u256(bond_atoms)
+        batch.bonds_settled = False
         batch.status = u8(STATUS_OPEN)
         batch.seed_sha256 = ""
         batch.audited_count = u32(0)
@@ -558,18 +850,24 @@ class AuditLot(gl.Contract):
         batch.matched_at = ""
         batch.sample_ready_at = ""
         batch.settled_at = ""
+
+        assessment.attempt_count = u32(int(assessment.attempt_count) + 1)
+        assessment.active_batch_id = batch_id
+
         BatchCreated(
             batch_id,
             gl.message.sender_address,
+            assessment_id=assessment_id,
             manifest_sha256=manifest_sha256,
-            rubric_sha256=batch.rubric_sha256,
+            rubric_sha256=rubric_sha256,
             item_count=count,
             sample_size=size,
             min_pass_bps=threshold,
+            bond_atoms=bond_atoms,
         ).emit()
         return batch_id
 
-    @gl.public.write
+    @gl.public.write.payable
     def join_entropy(self, batch_id: u256, partner_commitment: str) -> None:
         batch = self._require_batch(batch_id)
         if int(batch.status) != STATUS_OPEN:
@@ -578,7 +876,13 @@ class AuditLot(gl.Contract):
             raise gl.vm.UserError(f"{ERR_EXPECTED}: only designated entropy partner may join")
         if not self._deadline_open(batch):
             raise gl.vm.UserError(f"{ERR_EXPECTED}: reveal deadline has passed")
-        batch.partner_commitment = validate_digest(partner_commitment, "partner_commitment")
+        partner_commitment = validate_digest(partner_commitment, "partner_commitment")
+        if partner_commitment in self.used_commitments:
+            raise gl.vm.UserError(f"{ERR_EXPECTED}: commitment already used; every commitment must use a fresh secret")
+        if int(gl.message.value) != int(batch.bond_atoms):
+            raise gl.vm.UserError(f"{ERR_EXPECTED}: entropy partner bond must exactly match the producer's bond")
+        self.used_commitments[partner_commitment] = True
+        batch.partner_commitment = partner_commitment
         batch.status = u8(STATUS_MATCHED)
         batch.matched_at = current_datetime()
         EntropyJoined(batch_id, gl.message.sender_address).emit()
@@ -594,17 +898,19 @@ class AuditLot(gl.Contract):
         if len(secret) == 0 or len(secret) > MAX_SECRET_LEN:
             raise gl.vm.UserError(f"{ERR_EXPECTED}: secret length out of range")
         caller = gl.message.sender_address
-        digest = commitment_of(secret)
+        assessment_id = str(batch.assessment_id)
         if caller == batch.producer:
             if str(batch.producer_reveal) != "":
                 raise gl.vm.UserError(f"{ERR_EXPECTED}: producer already revealed")
-            if digest != str(batch.producer_commitment):
+            expected = commitment_of(secret, assessment_id, ROLE_PRODUCER)
+            if expected != str(batch.producer_commitment):
                 raise gl.vm.UserError(f"{ERR_EXPECTED}: producer commitment mismatch")
             batch.producer_reveal = secret
         elif caller == batch.entropy_partner:
             if str(batch.partner_reveal) != "":
                 raise gl.vm.UserError(f"{ERR_EXPECTED}: entropy partner already revealed")
-            if digest != str(batch.partner_commitment):
+            expected = commitment_of(secret, assessment_id, ROLE_PARTNER)
+            if expected != str(batch.partner_commitment):
                 raise gl.vm.UserError(f"{ERR_EXPECTED}: partner commitment mismatch")
             batch.partner_reveal = secret
         else:
@@ -618,8 +924,14 @@ class AuditLot(gl.Contract):
             raise gl.vm.UserError(f"{ERR_EXPECTED}: batch cannot be aborted")
         if self._deadline_open(batch):
             raise gl.vm.UserError(f"{ERR_EXPECTED}: reveal deadline has not passed")
+        was_matched = int(batch.status) == STATUS_MATCHED
         batch.status = u8(STATUS_ABORTED)
         batch.settled_at = current_datetime()
+        self._settle_bonds_on_abort(batch, was_matched)
+        assessment = self.assessments[batch.assessment_id]
+        assessment.active_batch_id = u256(0)
+        if was_matched:
+            assessment.abort_count = u32(int(assessment.abort_count) + 1)
         BatchSettled(batch_id, u8(STATUS_ABORTED), certificate_sha256="").emit()
 
     @gl.public.write
@@ -631,6 +943,9 @@ class AuditLot(gl.Contract):
             raise gl.vm.UserError(f"{ERR_EXPECTED}: only producer may cancel")
         batch.status = u8(STATUS_CANCELLED)
         batch.settled_at = current_datetime()
+        self._settle_bonds_on_abort(batch, False)
+        assessment = self.assessments[batch.assessment_id]
+        assessment.active_batch_id = u256(0)
         BatchSettled(batch_id, u8(STATUS_CANCELLED), certificate_sha256="").emit()
 
     @gl.public.write
@@ -740,7 +1055,9 @@ class AuditLot(gl.Contract):
                 f"{slot}:{int(record.item_index)}:{int(record.outcome)}:{record.item_sha256}"
             )
         certificate = sha256_text(
-            "AUDITLOT_CERT_V1|"
+            "AUDITLOT_CERT_V2|"
+            + str(batch.assessment_id)
+            + "|"
             + str(int(batch_id))
             + "|"
             + str(batch.manifest_sha256)
@@ -758,6 +1075,19 @@ class AuditLot(gl.Contract):
         batch.status = u8(terminal)
         batch.certificate_sha256 = certificate
         batch.settled_at = current_datetime()
+
+        if not bool(batch.bonds_settled):
+            batch.bonds_settled = True
+            bond = batch.bond_atoms
+            if int(bond) > 0:
+                self._pay(batch.producer, bond)
+                self._pay(batch.entropy_partner, bond)
+
+        assessment = self.assessments[batch.assessment_id]
+        assessment.resolved = True
+        assessment.resolved_batch_id = batch_id
+        assessment.active_batch_id = u256(0)
+
         BatchSettled(
             batch_id,
             u8(terminal),
@@ -772,6 +1102,7 @@ class AuditLot(gl.Contract):
         batch = self._require_batch(batch_id)
         return {
             "batch_id": int(batch_id),
+            "assessment_id": str(batch.assessment_id),
             "producer": str(batch.producer),
             "entropy_partner": str(batch.entropy_partner),
             "manifest_url": str(batch.manifest_url),
@@ -782,6 +1113,8 @@ class AuditLot(gl.Contract):
             "item_count": int(batch.item_count),
             "sample_size": int(batch.sample_size),
             "min_pass_bps": int(batch.min_pass_bps),
+            "bond_atoms": int(batch.bond_atoms),
+            "bonds_settled": bool(batch.bonds_settled),
             "status": int(batch.status),
             "status_name": status_name(int(batch.status)),
             "sample_indices": [int(batch.sample_indices[i]) for i in range(len(batch.sample_indices))],
@@ -821,6 +1154,34 @@ class AuditLot(gl.Contract):
         }
 
     @gl.public.view
+    def get_assessment(self, assessment_id: str) -> dict:
+        if assessment_id not in self.assessments:
+            raise gl.vm.UserError(f"{ERR_EXPECTED}: unknown assessment")
+        assessment = self.assessments[assessment_id]
+        return {
+            "assessment_id": str(assessment_id),
+            "manifest_sha256": str(assessment.manifest_sha256),
+            "rubric_sha256": str(assessment.rubric_sha256),
+            "item_count": int(assessment.item_count),
+            "sample_size": int(assessment.sample_size),
+            "min_pass_bps": int(assessment.min_pass_bps),
+            "bond_atoms": int(assessment.bond_atoms),
+            "attempt_count": int(assessment.attempt_count),
+            "abort_count": int(assessment.abort_count),
+            "max_aborts": MAX_ABORTS_PER_ASSESSMENT,
+            "resolved": bool(assessment.resolved),
+            "resolved_batch_id": int(assessment.resolved_batch_id),
+            "active_batch_id": int(assessment.active_batch_id),
+            "created_at": str(assessment.created_at),
+        }
+
+    @gl.public.view
+    def assessment_id_for(self, manifest_sha256: str, rubric_sha256: str) -> str:
+        manifest_sha256 = validate_digest(manifest_sha256, "manifest_sha256")
+        rubric_sha256 = validate_digest(rubric_sha256, "rubric_sha256")
+        return assessment_id_of(manifest_sha256, rubric_sha256)
+
+    @gl.public.view
     def is_certified(self, batch_id: u256, expected_certificate_sha256: str) -> bool:
         if batch_id not in self.batches:
             return False
@@ -840,6 +1201,7 @@ class AuditLot(gl.Contract):
         pass_bps = (int(batch.pass_count) * 10000) // int(batch.sample_size)
         return {
             "batch_id": int(batch_id),
+            "assessment_id": str(batch.assessment_id),
             "status": int(batch.status),
             "status_name": status_name(int(batch.status)),
             "certificate_sha256": str(batch.certificate_sha256),

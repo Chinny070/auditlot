@@ -2,13 +2,64 @@ name: auditlot-ci
 on:
   push:
   pull_request:
+
+env:
+  PYTHONIOENCODING: utf-8
+
 jobs:
-  protocol:
+  checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python scripts/preflight.py
-      - run: python -m unittest discover -s tests -v
+
+      - name: Install pinned tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install genvm-linter==0.10.0 genlayer-test==0.29.2
+
+      - name: Repository preflight (network/syntax/secret-token checks)
+        run: python scripts/preflight.py
+
+      - name: Python compilation check
+        run: |
+          python -m py_compile contracts/auditlot.py
+          python -m py_compile scripts/build_manifest.py scripts/commit.py scripts/preflight.py
+
+      - name: Deterministic protocol-model unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: GenVM lint (AST safety + SDK validation)
+        run: genvm-lint check contracts/auditlot.py
+
+      - name: GenVM type check
+        run: genvm-lint typecheck contracts/auditlot.py
+
+      - name: GenVM ABI schema extraction
+        run: genvm-lint schema contracts/auditlot.py
+
+      - name: GenVM direct-mode (GLSim) behavioral suite
+        run: gltest tests/direct -v
+
+      - name: Secret / private-key / local-artifact scan
+        run: |
+          set -euo pipefail
+          fail=0
+          # No dotenv, keystore, or raw private-key-shaped files committed.
+          if git ls-files | grep -E '(^|/)\.env($|\.)|keystore|\.pem$|\.ppk$|id_rsa|id_ed25519' ; then
+            echo "::error::possible secret/key material is tracked in git"
+            fail=1
+          fi
+          # No stray caches/build artifacts committed.
+          if git ls-files | grep -E '__pycache__/|\.pyc$|(^|/)\.pytest_cache/|(^|/)artifacts/|(^|/)\.hypothesis/' ; then
+            echo "::error::generated cache/artifact files are tracked in git"
+            fail=1
+          fi
+          # Forbidden-network-token scanning (must target only Studionet
+          # chain 61999) is scripts/preflight.py's job and runs as its own
+          # step above; not duplicated here to avoid this workflow file's
+          # own necessarily-literal grep patterns tripping that same scan.
+          exit $fail

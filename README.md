@@ -4,7 +4,7 @@
 
 AuditLot is a standalone Intelligent Contract primitive for certifying large batches without asking GenLayer validators to inspect every item and without letting the producer choose the audited examples.
 
-It uses a two-party commit/reveal entropy ceremony to select a unique sample *after* an immutable batch manifest is committed. Each selected item is independently fetched and hash-verified by validators, then semantically judged against a rubric that was frozen before the sample existed. Batch settlement is deterministic.
+It uses a two-party, bonded commit/reveal entropy ceremony to select a unique sample *after* an immutable batch manifest is committed. Each selected item is independently fetched and hash-verified by validators, then semantically judged against a rubric that was frozen before the sample existed. Batch settlement is deterministic.
 
 ## Network
 
@@ -33,9 +33,9 @@ AuditLot creates a third option:
 ```text
 immutable manifest
       ↓
-producer entropy commitment
+producer entropy commitment (bonded)
       +
-independent partner entropy commitment
+independent partner entropy commitment (bonded, matching)
       ↓
 both reveal after commitments are fixed
       ↓
@@ -45,22 +45,22 @@ validators independently fetch + hash-check each sampled item
       ↓
 semantic PASS / FAIL / INCONCLUSIVE per item
       ↓
-deterministic batch certificate
+deterministic batch certificate, assessment marked resolved
 ```
 
-Neither party can know the final sample when it makes its commitment as long as at least one of the two secrets is honestly chosen and kept private until reveal.
+**On the fairness claim:** if both parties choose fresh, independent secrets, neither can determine the sample before both commitments are fixed. This does **not** by itself mean the reveal step is fair against a party willing to preview the result before deciding whether to submit its own reveal — see [`docs/SECURITY_MODEL.md`](docs/SECURITY_MODEL.md) for the precise, narrowly-qualified guarantee AuditLot actually makes (bonding + a capped retry count, not unconditional unbiasedness) and why: no verifiable-random-function or randomness-beacon primitive is exposed to Intelligent Contracts on this platform as of this writing.
 
 ## What GenLayer decides vs what code decides
 
 **Consensus decides only:** whether each sampled immutable text artefact clearly passes, fails, or is inconclusive against the already-frozen rubric.
 
-**Deterministic code decides:** commitment validity, entropy combination, sample indexes, uniqueness, manifest/item hashes, counters, threshold arithmetic, lifecycle transitions, and the final certificate hash.
+**Deterministic code decides:** commitment validity, entropy combination, sample indexes, uniqueness, manifest/item hashes, counters, threshold arithmetic, lifecycle transitions, bond accounting, and the final certificate hash.
 
 The LLM never chooses the sample, never changes the threshold, and never decides the final batch status directly.
 
 ## Manifest format
 
-AuditLot v1 accepts immutable UTF-8 text artefacts over HTTPS.
+AuditLot accepts immutable UTF-8 text artefacts over HTTPS.
 
 ```json
 {
@@ -75,21 +75,35 @@ AuditLot v1 accepts immutable UTF-8 text artefacts over HTTPS.
 }
 ```
 
-The exact manifest response body is itself hashed and pinned on-chain. Every sampled item's exact response body is also hash-pinned inside the manifest.
+The exact manifest response body is itself hashed and pinned on-chain. Every sampled item's exact response body is also hash-pinned inside the manifest. (This is the manifest *data format* version, separate from the sampling-protocol version below; a v2 protocol contract still reads `"version": "auditlot-1"` manifests.)
 
 Use `scripts/build_manifest.py` to generate a canonical manifest and its digest.
+
+## Assessments and batches
+
+An **assessment** is the canonical identity of what's being tested: this exact manifest plus this exact rubric, on this exact chain and contract. Get it from the deployed contract itself —
+
+```bash
+genlayer call <contract> assessment_id_for --args <manifest_sha256> <rubric_sha256>
+```
+
+— rather than reimplementing the hash formula off-chain. A **batch** is one concrete attempt at an assessment. An assessment can be resolved (produce one real, fully-sampled, fully-audited terminal result) **at most once, ever** — once resolved, `create_batch` refuses any further attempt for that manifest+rubric, at any sample size or threshold, so a producer cannot cherry-pick a favorable result out of several real draws. See `docs/SECURITY_MODEL.md` and `docs/ARCHITECTURE.md`.
 
 ## Lifecycle
 
 1. **Producer:** build immutable manifest and rubric.
-2. **Producer:** generate a fresh secret and commitment with `scripts/commit.py`.
-3. **Producer:** call `create_batch(...)`, naming an independent entropy partner.
-4. **Partner:** generate a fresh secret/commitment and call `join_entropy(...)`.
+2. **Producer:** look up the assessment id with `assessment_id_for(manifest_sha256, rubric_sha256)`, then generate a fresh secret and commitment with `scripts/commit.py <assessment_id> producer`.
+3. **Producer:** call `create_batch(...)` (payable — the attached GEN becomes the bond both sides must post), naming an independent entropy partner.
+4. **Partner:** generate a fresh secret/commitment with `scripts/commit.py <assessment_id> partner`, then call `join_entropy(...)` (payable, must match the producer's bond exactly).
 5. **Producer + partner:** each calls `reveal_entropy(...)` before the deadline.
 6. Once both reveals match their commitments, AuditLot deterministically derives unique sample indexes and enters `SAMPLE_READY`.
 7. Anyone can call `audit_sample(batch_id, slot)` for every sample slot.
-8. Anyone can call `settle(batch_id)` after every selected slot is resolved.
+8. Anyone can call `settle(batch_id)` after every selected slot is resolved — both bonds are refunded in full, regardless of the terminal outcome, and the assessment is marked resolved.
 9. The terminal status is `CERTIFIED`, `REJECTED`, or `INCONCLUSIVE`.
+10. If either side fails to reveal by the deadline, anyone can call `abort_non_reveal(...)`: the non-revealer's bond is forfeited to whichever side did reveal (or both refunded if neither did). A retry for the same assessment is allowed, up to `MAX_ABORTS_PER_ASSESSMENT` (3) times, reusing the exact locked sampling parameters and bond.
+11. `cancel_unmatched(...)` lets the producer withdraw (and get its bond back) an `OPEN` batch nobody has joined yet.
+
+`IAuditLot` (in `contracts/auditlot.py`) declares the full public interface for downstream integrators — every method above, including `abort_non_reveal` and `cancel_unmatched`, not just the happy-path methods.
 
 ## Settlement rule
 
@@ -102,13 +116,12 @@ This conservative policy makes the certificate easy for other builders to reason
 
 ## Commitments
 
-The commitment is:
-
 ```text
-sha256("AUDITLOT_V1|" + secret)
+assessment_id = sha256("AUDITLOT_ASSESSMENT_V2|" + chain_id + "|" + contract_address + "|" + manifest_sha256 + "|" + rubric_sha256)
+commitment    = sha256("AUDITLOT_COMMIT_V2|" + assessment_id + "|" + role + "|" + secret)   # role: "producer" | "partner"
 ```
 
-Always use a fresh high-entropy secret for every batch.
+Get `assessment_id` from the deployed contract's `assessment_id_for` view method; don't hand-roll the hash. Every commitment the contract accepts must be globally fresh — reusing one (even for a different assessment or role) is rejected on-chain, not just discouraged by convention, because a revealed secret is permanently public and reusing it hands away real entropy.
 
 ## Deployment
 
@@ -130,22 +143,22 @@ Then deploy and execute the live matrix in `docs/LIVE_TEST_PLAN.md` from Studio.
 
 ### Live on Studionet
 
-AuditLot is deployed and finalized at `0x601b8d1Db0fEC038c9281DB0c9897A2481bbeFc9` on Studionet (chain 61999). The complete live acceptance matrix — a CERTIFIED batch, a REJECTED batch, an INCONCLUSIVE (fail-closed hash-mismatch) batch, commitment-mismatch rejection, full-permutation sample uniqueness, non-reveal `ABORTED` liveness, and every replay/state-machine rejection in `docs/LIVE_TEST_PLAN.md` — was executed with real finalized transactions. See `docs/DEPLOYMENT_EVIDENCE.md` for every transaction hash and outcome.
+See `docs/DEPLOYMENT_EVIDENCE.md`, which clearly separates the superseded v1 deployment (the pre-fairness-redesign contract; do not use) from the current v2 deployment evidence.
 
 ## Security boundaries
 
 AuditLot proves a bounded statement:
 
-> A deterministic blind sample from this exact manifest achieved this terminal result against this exact rubric under GenLayer consensus.
+> A deterministic blind sample from this exact manifest achieved this terminal result against this exact rubric under GenLayer consensus, for this specific, permanently-non-retriable assessment.
 
-It does **not** prove every unsampled item is good, does not prove the producer disclosed every real-world item, and does not claim statistical guarantees beyond the sample policy chosen by the user. See `docs/SECURITY_MODEL.md`.
+It does **not** prove every unsampled item is good, does not prove the producer disclosed every real-world item, does not claim statistical guarantees beyond the sample policy chosen by the user, and does not claim the blind sample is unconditionally unbiased against a party willing to forfeit its bond. See `docs/SECURITY_MODEL.md` for the full, precise claim.
 
 ## Repository map
 
 ```text
 contracts/auditlot.py          standalone Intelligent Contract
 scripts/build_manifest.py      canonical manifest helper
-scripts/commit.py              entropy commitment helper
+scripts/commit.py              entropy commitment helper (v2: assessment + role bound)
 scripts/preflight.py           network/syntax/repository checks
 tests/test_protocol_model.py   deterministic protocol-model tests
 tests/direct/                  GenVM direct-mode (GLSim) execution tests
@@ -153,9 +166,9 @@ fixtures/certified/            live-demo fixture: all sampled items PASS
 fixtures/rejected/             live-demo fixture: all sampled items FAIL
 fixtures/inconclusive/         live-demo fixture: intentional hash mismatch
 docs/ARCHITECTURE.md           state and consensus architecture
-docs/SECURITY_MODEL.md         threat model and epistemic limits
+docs/SECURITY_MODEL.md         threat model, last-revealer analysis, and epistemic limits
 docs/LIVE_TEST_PLAN.md         Studio acceptance matrix
-docs/DEPLOYMENT_EVIDENCE.md    finalized Studionet deployment + live matrix evidence
+docs/DEPLOYMENT_EVIDENCE.md    v1 (superseded) and v2 deployment + live matrix evidence
 SUBMISSION.md                   reviewer-facing submission draft
 ```
 
