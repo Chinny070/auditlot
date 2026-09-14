@@ -1,0 +1,1 @@
+v1.3.0 - Introduced a new keyboard shortcut panel and improved screen reader labels for the navigation sidebar to support accessibility.

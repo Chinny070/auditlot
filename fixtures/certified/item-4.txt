@@ -1,0 +1,1 @@
+v1.4.0 - Added the ability to export project data as a portable archive and improved error messages shown during failed uploads.

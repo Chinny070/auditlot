@@ -1,0 +1,1 @@
+v1.4.1 - Fixed a timezone display bug affecting scheduled reminders and improved the responsiveness of the mobile layout on small screens.

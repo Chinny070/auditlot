@@ -1,0 +1,1 @@
+v1.2.0 - Improved dashboard loading time by roughly forty percent and fixed a rare crash that occurred when exporting large reports to CSV.
