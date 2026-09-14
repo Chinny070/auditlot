@@ -36,7 +36,7 @@ jobs:
       - name: Install pinned tooling
         run: |
           python -m pip install --upgrade pip
-          pip install genvm-linter==0.11.0 genlayer-test==0.29.2
+          pip install genvm-linter==0.10.0 genlayer-test==0.29.2
 
       - name: Cache GenVM SDK downloads
         uses: actions/cache@v4
@@ -44,7 +44,7 @@ jobs:
           path: |
             ~/.cache/genvm-linter
             ~/.cache/gltest-direct
-          key: genvm-sdk-${{ env.GENVM_LINTER_VERSION }}-v0.3.0-rc7
+          key: genvm-sdk-r2-${{ env.GENVM_LINTER_VERSION }}-v0.3.0-rc7
 
       - name: Pre-download genvm-linter's pinned GenVM SDK
         # genvm-linter's own `download` command uses urllib.request under the
