@@ -14,7 +14,14 @@ env:
   # runner) and keeps both tools reproducible across CI runs. Confirmed
   # against the GitHub releases API that both tags below ship a usable
   # runner-bundle asset before pinning them here.
-  GENVM_LINTER_VERSION: v0.6.0-rc5
+  # Must be a GenVM SDK release that actually bundles the specific
+  # py-genlayer runner contracts/auditlot.py pins in its Depends header
+  # (1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6). Newer releases
+  # (tried v0.6.0-rc5) have dropped that older runner hash entirely
+  # ("filename ... not found"); v0.6.0-rc1 -- genvm-linter 0.10.0's own
+  # documented default fallback version -- still has it, confirmed by both
+  # a local `genvm-lint check` run and this workflow's CI history.
+  GENVM_LINTER_VERSION: v0.6.0-rc1
 
 jobs:
   checks:
