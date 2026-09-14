@@ -38,4 +38,7 @@ AuditLot certifies only the sampled evidence against the frozen rubric. It does 
 
 ## Testing evidence
 
-See `docs/LIVE_TEST_PLAN.md` and `docs/DEPLOYMENT_EVIDENCE.md`. Deployment evidence must be populated from finalized Studionet transactions before submission.
+- `python scripts/preflight.py` and `python -m unittest discover -s tests -v` — deterministic protocol-model checks (commitment domain separation, unbiased unique sampling, fail-closed settlement math).
+- `gltest tests/direct -v` — 37 GenVM direct-mode (GLSim) execution tests against the real contract file, covering storage (`TreeMap`, `DynArray`), decorators, `gl.vm.run_nondet_unsafe` leader/validator closures, and independently-verified validator agreement/disagreement.
+- `genvm-lint check contracts/auditlot.py` — AST safety lint, SDK-based semantic validation, and Pyright type-checking all pass.
+- Deployed and finalized on Studionet (chain 61999) at `0x601b8d1Db0fEC038c9281DB0c9897A2481bbeFc9`. The full live matrix in `docs/LIVE_TEST_PLAN.md` — CERTIFIED, REJECTED, and INCONCLUSIVE (fail-closed hash-mismatch) batches; commitment-mismatch rejection; full-permutation sample uniqueness; non-reveal `ABORTED` liveness; and every replay/state-machine rejection — was executed with real finalized transactions and independently re-verified validator behavior. See `docs/DEPLOYMENT_EVIDENCE.md` for every transaction hash and outcome.

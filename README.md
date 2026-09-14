@@ -122,9 +122,15 @@ Before deployment:
 ```bash
 python scripts/preflight.py
 python -m unittest discover -s tests -v
+gltest tests/direct -v
+genvm-lint check contracts/auditlot.py
 ```
 
 Then deploy and execute the live matrix in `docs/LIVE_TEST_PLAN.md` from Studio. Record the finalized transaction hashes and deployed address in `docs/DEPLOYMENT_EVIDENCE.md` before submission.
+
+### Live on Studionet
+
+AuditLot is deployed and finalized at `0x601b8d1Db0fEC038c9281DB0c9897A2481bbeFc9` on Studionet (chain 61999). The complete live acceptance matrix — a CERTIFIED batch, a REJECTED batch, an INCONCLUSIVE (fail-closed hash-mismatch) batch, commitment-mismatch rejection, full-permutation sample uniqueness, non-reveal `ABORTED` liveness, and every replay/state-machine rejection in `docs/LIVE_TEST_PLAN.md` — was executed with real finalized transactions. See `docs/DEPLOYMENT_EVIDENCE.md` for every transaction hash and outcome.
 
 ## Security boundaries
 
@@ -142,10 +148,14 @@ scripts/build_manifest.py      canonical manifest helper
 scripts/commit.py              entropy commitment helper
 scripts/preflight.py           network/syntax/repository checks
 tests/test_protocol_model.py   deterministic protocol-model tests
+tests/direct/                  GenVM direct-mode (GLSim) execution tests
+fixtures/certified/            live-demo fixture: all sampled items PASS
+fixtures/rejected/             live-demo fixture: all sampled items FAIL
+fixtures/inconclusive/         live-demo fixture: intentional hash mismatch
 docs/ARCHITECTURE.md           state and consensus architecture
 docs/SECURITY_MODEL.md         threat model and epistemic limits
 docs/LIVE_TEST_PLAN.md         Studio acceptance matrix
-docs/DEPLOYMENT_EVIDENCE.md    fill after finalized deployment
+docs/DEPLOYMENT_EVIDENCE.md    finalized Studionet deployment + live matrix evidence
 SUBMISSION.md                   reviewer-facing submission draft
 ```
 
