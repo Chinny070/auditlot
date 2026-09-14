@@ -5,6 +5,16 @@ on:
 
 env:
   PYTHONIOENCODING: utf-8
+  # genvm-linter (genlayerlabs/genvm-manager releases) and gltest's direct-
+  # mode SDK loader (genlayerlabs/genvm releases) each resolve their own
+  # GenVM build independently and do not share a version namespace, despite
+  # both reading a GENVM_VERSION env var. Pinning each explicitly, in its
+  # own step below, avoids depending on "latest release" resolution (which
+  # 404'd for genvm-linter on an unauthenticated, cold GitHub Actions
+  # runner) and keeps both tools reproducible across CI runs. Confirmed
+  # against the GitHub releases API that both tags below ship a usable
+  # runner-bundle asset before pinning them here.
+  GENVM_LINTER_VERSION: v0.6.0-rc1
 
 jobs:
   checks:
@@ -20,6 +30,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install genvm-linter==0.10.0 genlayer-test==0.29.2
+
+      - name: Cache GenVM SDK downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/genvm-linter
+            ~/.cache/gltest-direct
+          key: genvm-sdk-${{ env.GENVM_LINTER_VERSION }}-v0.3.0-rc7
+
+      - name: Pre-download genvm-linter's pinned GenVM SDK
+        run: genvm-lint download -v ${{ env.GENVM_LINTER_VERSION }}
 
       - name: Repository preflight (network/syntax/secret-token checks)
         run: python scripts/preflight.py
@@ -42,6 +63,11 @@ jobs:
         run: genvm-lint schema contracts/auditlot.py
 
       - name: GenVM direct-mode (GLSim) behavioral suite
+        env:
+          # Pinned separately from GENVM_LINTER_VERSION -- see the note on
+          # the top-level env block above; this is genlayerlabs/genvm's own
+          # tag namespace, not genlayerlabs/genvm-manager's.
+          GENVM_VERSION: v0.3.0-rc7
         run: gltest tests/direct -v
 
       - name: Secret / private-key / local-artifact scan
