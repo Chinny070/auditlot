@@ -39,15 +39,32 @@ jobs:
             ~/.cache/gltest-direct
           key: genvm-sdk-${{ env.GENVM_LINTER_VERSION }}-v0.3.0-rc7
 
-      - name: DIAGNOSTIC -- raw HTTP probe of the release asset
-        run: |
-          url="https://github.com/genlayerlabs/genvm-manager/releases/download/${{ env.GENVM_LINTER_VERSION }}/genvm-universal.tar.xz"
-          echo "probing: $url"
-          curl -sS -I -L -o /tmp/headers.txt -w "final_http_code=%{http_code} redirects=%{num_redirects} url_effective=%{url_effective}\n" "$url" || true
-          cat /tmp/headers.txt
-
       - name: Pre-download genvm-linter's pinned GenVM SDK
-        run: genvm-lint download -v ${{ env.GENVM_LINTER_VERSION }}
+        # genvm-linter's own `download` command uses urllib.request under the
+        # hood and reliably 404s on GitHub Actions runners even though the
+        # exact same release-asset URL returns HTTP 200 to a plain curl
+        # request from the same runner (confirmed by a one-off diagnostic
+        # step during CI setup: curl -IL got a clean 200 through GitHub's
+        # release-asset redirect while genvm-lint's own downloader reported
+        # 404 for that identical URL). This is a bug in the third-party
+        # tool's HTTP client, not a network or config problem on our side.
+        # Work around it by fetching the tarball ourselves with curl and
+        # placing it at genvm-linter's exact expected cache path
+        # (genvm_linter.validate.artifacts.get_tarball_path), so its own
+        # download_artifacts() finds it already cached and never makes a
+        # network call at all.
+        run: |
+          set -euo pipefail
+          cache_dir="$HOME/.cache/genvm-linter"
+          mkdir -p "$cache_dir"
+          dest="$cache_dir/genvm-universal-genlayerlabs-genvm-manager-${{ env.GENVM_LINTER_VERSION }}.tar.xz"
+          if [ -s "$dest" ]; then
+            echo "already cached: $dest"
+          else
+            url="https://github.com/genlayerlabs/genvm-manager/releases/download/${{ env.GENVM_LINTER_VERSION }}/genvm-universal.tar.xz"
+            curl -sS -L -f -o "$dest" "$url"
+          fi
+          ls -la "$dest"
 
       - name: Repository preflight (network/syntax/secret-token checks)
         run: python scripts/preflight.py
