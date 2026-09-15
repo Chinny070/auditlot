@@ -102,6 +102,26 @@ jobs:
       - name: GenVM ABI schema extraction
         run: genvm-lint schema contracts/auditlot.py
 
+      - name: Pre-download gltest's pinned GenVM SDK
+        # Same class of bug as genvm-linter's downloader above, in gltest's
+        # own separate sdk_loader (genlayerlabs/genvm releases, not
+        # genlayerlabs/genvm-manager -- different repo, different tag
+        # namespace, despite both reading a GENVM_VERSION env var). Fetch
+        # with curl and place at gltest's exact expected cache path so its
+        # own download_artifacts() never makes a network call.
+        run: |
+          set -euo pipefail
+          cache_dir="$HOME/.cache/gltest-direct"
+          mkdir -p "$cache_dir"
+          dest="$cache_dir/genvm-universal-v0.3.0-rc7.tar.xz"
+          if [ -s "$dest" ]; then
+            echo "already cached: $dest"
+          else
+            curl -sS -L -f -o "$dest" \
+              "https://github.com/genlayerlabs/genvm/releases/download/v0.3.0-rc7/genvm-runners-all.tar.xz"
+          fi
+          ls -la "$dest"
+
       - name: GenVM direct-mode (GLSim) behavioral suite
         env:
           # Pinned separately from GENVM_LINTER_VERSION -- see the note on
