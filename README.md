@@ -105,6 +105,8 @@ genlayer call <contract> assessment_id_for --args <manifest_sha256> <rubric_sha2
 
 `IAuditLot` (in `contracts/auditlot.py`) declares the full public interface for downstream integrators — every method above, including `abort_non_reveal` and `cancel_unmatched`, not just the happy-path methods.
 
+**`create_batch` and `join_entropy` signal rejection by return value, not by reverting.** Both are payable, and GenVM credits attached value to the contract *before* the method body runs and does not roll that credit back on revert — so if either method reverted on invalid input, the caller's GEN would be stranded with no way to refund it (this happened during live testing on Studionet and is the reason for this design). Instead, both methods catch every internal failure, refund the attached value to the caller, emit `CreateBatchRejected(sender, reason)` / `JoinEntropyRejected(batch_id, sender, reason)`, and return a sentinel (`u256(0)` for `create_batch`, `False` for `join_entropy`) from an otherwise-successful call. Integrators must check the return value (or the rejection event), not `expect_revert`-style handling, to detect failure from these two methods. Every other write method still raises normally on failure.
+
 ## Settlement rule
 
 - If **any** sampled item is `INCONCLUSIVE`, the whole batch is `INCONCLUSIVE`. AuditLot does not turn missing evidence into a pass or fail.

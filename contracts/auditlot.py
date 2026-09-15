@@ -1,4 +1,4 @@
-# v0.2.1
+# v0.2.2
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 from genlayer import *
@@ -178,6 +178,25 @@ class IAuditLot:
         def get_certificate(self, batch_id: u256) -> dict: ...
 
     class Write:
+        # create_batch and join_entropy are payable. GenVM credits the
+        # attached GEN to this contract's balance as part of message
+        # delivery, before either method body runs, and does NOT reverse
+        # that credit if the call subsequently fails -- confirmed live on
+        # Studionet (see docs/SECURITY_MODEL.md). A normal `raise` after
+        # accepting value would therefore strand it permanently, since a
+        # failed call produces no batch/assessment record to attach a
+        # refund to and any state/message side effects scheduled before an
+        # exception propagates out are themselves rolled back with it.
+        # Both methods therefore never raise once payable: on any
+        # validation failure they refund gl.message.value in full to
+        # gl.message.sender_address, emit a *Rejected event carrying the
+        # reason, and return a sentinel (batch_id 0 / False) instead of
+        # raising, so the refund and the event are part of a transaction
+        # that actually succeeds rather than one that reverts. Callers of
+        # these two methods specifically must check the return value, not
+        # rely on a revert, to detect failure. Every other method on this
+        # contract (including reveal_entropy, which is not payable) is
+        # unaffected and still reverts normally on failure.
         def create_batch(
             self,
             manifest_url: str,
@@ -190,7 +209,7 @@ class IAuditLot:
             sample_size: u32,
             min_pass_bps: u32,
         ) -> u256: ...
-        def join_entropy(self, batch_id: u256, partner_commitment: str) -> None: ...
+        def join_entropy(self, batch_id: u256, partner_commitment: str) -> bool: ...
         def reveal_entropy(self, batch_id: u256, secret: str) -> None: ...
         def abort_non_reveal(self, batch_id: u256) -> None: ...
         def cancel_unmatched(self, batch_id: u256) -> None: ...
@@ -204,6 +223,14 @@ class BatchCreated(gl.Event):
 
 class EntropyJoined(gl.Event):
     def __init__(self, batch_id: u256, partner: Address, /, **blob): ...
+
+
+class CreateBatchRejected(gl.Event):
+    def __init__(self, sender: Address, /, **blob): ...
+
+
+class JoinEntropyRejected(gl.Event):
+    def __init__(self, batch_id: u256, sender: Address, /, **blob): ...
 
 
 class SampleReady(gl.Event):
@@ -742,13 +769,22 @@ class AuditLot(gl.Contract):
 
     def _refund_value(self) -> None:
         """GenVM credits gl.message.value to this contract's balance as part
-        of message delivery, before the target method body ever runs -- and
-        that credit is NOT rolled back if the method subsequently reverts
-        (confirmed live on Studionet: a rejected create_batch call left its
-        attached value stranded in the contract with no batch ever created
-        to attach a refund to). Every payable method must therefore refund
-        whatever it received itself on any failure path, since the platform
-        will not do it automatically."""
+        of message delivery, before the target method body ever runs. That
+        credit itself is never rolled back, no matter what the method does
+        afterward. But this refund call happens *inside* the same method
+        invocation as the failure it is responding to: if that invocation
+        were allowed to end by propagating an exception (a `raise`), GenVM
+        would revert the whole call, and reverting rolls back every normal
+        side effect made during it -- including this refund's own scheduled
+        transfer message. Confirmed live on Studionet the hard way: an
+        earlier version of this fix called _refund_value() and then
+        re-raised, and the "refund" never arrived; the caller's GEN stayed
+        stranded in the contract exactly as before the fix existed. So
+        create_batch/join_entropy must never raise once they are payable --
+        see their wrappers below, which catch every failure, refund here,
+        and then return normally instead of re-raising, so the whole call
+        is a *success* from GenVM's perspective and this scheduled transfer
+        actually commits."""
         value = int(gl.message.value)
         if value > 0:
             self._pay(gl.message.sender_address, u256(value))
@@ -778,9 +814,13 @@ class AuditLot(gl.Contract):
                 sample_size,
                 min_pass_bps,
             )
-        except Exception:
+        except Exception as exc:
             self._refund_value()
-            raise
+            CreateBatchRejected(
+                gl.message.sender_address,
+                reason=clean_text(str(exc), MAX_REASON_LEN),
+            ).emit()
+            return u256(0)
 
     def _create_batch_impl(
         self,
@@ -909,12 +949,18 @@ class AuditLot(gl.Contract):
         return batch_id
 
     @gl.public.write.payable
-    def join_entropy(self, batch_id: u256, partner_commitment: str) -> None:
+    def join_entropy(self, batch_id: u256, partner_commitment: str) -> bool:
         try:
             self._join_entropy_impl(batch_id, partner_commitment)
-        except Exception:
+            return True
+        except Exception as exc:
             self._refund_value()
-            raise
+            JoinEntropyRejected(
+                batch_id,
+                gl.message.sender_address,
+                reason=clean_text(str(exc), MAX_REASON_LEN),
+            ).emit()
+            return False
 
     def _join_entropy_impl(self, batch_id: u256, partner_commitment: str) -> None:
         batch = self._require_batch(batch_id)

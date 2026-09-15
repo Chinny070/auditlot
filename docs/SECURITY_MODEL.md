@@ -166,13 +166,39 @@ direct-mode harness does not model native value movement at all (see
 `tests/direct/test_auditlot_direct.py`'s `install_transfer_recorder` helper
 and its docstring), so this class of bug is invisible to it.
 
-**Fix:** both payable methods now wrap their entire body in a try/except
-that refunds `gl.message.value` to `gl.message.sender_address` before
-re-raising any exception (see `_refund_value`, `create_batch`,
-`join_entropy`). Any integrator building their own payable GenLayer contract
-should assume the same platform behavior applies to them and adopt the same
-pattern: never assume a reverted payable call is a no-op with respect to
-value.
+**First attempted fix (also wrong, also disproven live):** wrapping the
+body in a try/except that calls `_refund_value()` and then re-raises the
+original exception. This looked correct in the direct-mode test suite,
+which does not model value at all, but failed live: GenVM does not give a
+reverting call atomic-except-for-the-initial-credit semantics the way the
+credit itself is exempt from rollback. Every *other* side effect scheduled
+during a call that ultimately reverts is rolled back along with it --
+including a refund transfer scheduled by the failure handler itself. Live
+`eth_getBalance` polling after a deliberately-rejected small-value call
+showed the contract's balance never dropped and the sender was never
+refunded, confirming the scheduled refund was itself undone by the revert.
+
+**Actual fix:** `create_batch` and `join_entropy` must never let an
+exception escape once they are payable. Both methods now catch every
+failure internally, refund `gl.message.value` to `gl.message.sender_address`
+via `_refund_value()`, emit a `CreateBatchRejected` / `JoinEntropyRejected`
+event describing the reason, and **return a sentinel value normally**
+(`u256(0)` for `create_batch`, `False` for `join_entropy`) instead of
+raising. Because the call then completes successfully from GenVM's
+perspective, the refund is a normal side effect of a *successful* call and
+is not rolled back.
+
+This is a real, integrator-facing behavior change: callers of these two
+methods must check the return value (or listen for the `*Rejected` event),
+not rely on the call reverting, to detect rejection. Every other write
+method (`reveal_entropy`, `abort_non_reveal`, `cancel_unmatched`,
+`audit_sample`, `settle`) is unaffected and still raises normally on
+failure, since none of them are payable. Any integrator building their own
+payable GenLayer contract should assume the same platform behavior applies
+to them: never assume a reverted payable call is a no-op with respect to
+value, and never assume a refund scheduled inside a failure path that ends
+in `raise` will actually be delivered -- only a normally-returning call
+commits its side effects.
 
 ### Bond value is meaningful
 

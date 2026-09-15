@@ -293,27 +293,36 @@ def test_create_batch_rejects_bond_below_minimum(direct_deploy, direct_vm, direc
     direct_vm.sender = direct_owner
     direct_vm.value = MIN_BOND_ATOMS - 1
     try:
-        with direct_vm.expect_revert("bond must be at least"):
-            contract.create_batch(
-                manifest_url="https://fixtures.example.org/manifest-lowbond.json",
-                manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
-                entropy_partner=_as_address(direct_alice), producer_commitment=commitment,
-                reveal_deadline=FUTURE_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
-            )
+        # create_batch/join_entropy never raise once payable -- see the note
+        # on IAuditLot.Write in the contract. They refund in full and
+        # return a sentinel (batch_id 0 / False) instead, so a refund
+        # scheduled before a would-be revert isn't itself rolled back by
+        # that revert. Callers must check the return value.
+        batch_id = contract.create_batch(
+            manifest_url="https://fixtures.example.org/manifest-lowbond.json",
+            manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
+            entropy_partner=_as_address(direct_alice), producer_commitment=commitment,
+            reveal_deadline=FUTURE_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
+        )
     finally:
         direct_vm.value = 0
+    assert batch_id == 0
 
 
 def test_create_batch_refunds_value_when_a_later_validation_fails(direct_deploy, direct_vm, direct_owner, direct_alice):
     # GenVM credits gl.message.value to the contract as part of message
     # delivery, before the method body runs, and does NOT roll that credit
-    # back on revert (confirmed live on Studionet: a rejected create_batch
-    # call left its value permanently stranded before this fix existed).
-    # Every payable method must therefore explicitly refund on any failure
-    # path. This test attaches a valid bond but an otherwise-invalid
-    # argument (self as entropy partner) so the failure happens well after
-    # the bond-amount check, proving the refund wrapper covers the whole
-    # method body, not just the bond check itself.
+    # back on revert -- confirmed live on Studionet the hard way: a first
+    # version of this fix refunded and then re-raised, and the "refund"
+    # never arrived, because re-raising still reverts the whole call and a
+    # revert rolls back every normal side effect made during it, including
+    # a refund transfer scheduled just before the raise. create_batch must
+    # therefore never raise once payable -- it refunds and returns 0
+    # instead, so the call is a *success* from GenVM's perspective and the
+    # scheduled refund actually commits. This test attaches a valid bond
+    # but an otherwise-invalid argument (self as entropy partner) so the
+    # failure happens well after the bond-amount check, proving the refund
+    # wrapper covers the whole method body, not just the bond check.
     contract = _deploy(direct_deploy)
     items, bodies = make_items(1)
     _, manifest_sha = canonical_manifest(items)
@@ -323,15 +332,15 @@ def test_create_batch_refunds_value_when_a_later_validation_fails(direct_deploy,
     direct_vm.sender = direct_owner
     direct_vm.value = MIN_BOND_ATOMS
     try:
-        with direct_vm.expect_revert("entropy partner must be independent"):
-            contract.create_batch(
-                manifest_url="https://fixtures.example.org/manifest-refund-fail.json",
-                manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
-                entropy_partner=_as_address(direct_owner), producer_commitment=commitment,
-                reveal_deadline=FUTURE_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
-            )
+        batch_id = contract.create_batch(
+            manifest_url="https://fixtures.example.org/manifest-refund-fail.json",
+            manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
+            entropy_partner=_as_address(direct_owner), producer_commitment=commitment,
+            reveal_deadline=FUTURE_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
+        )
     finally:
         direct_vm.value = 0
+    assert batch_id == 0
     assert transfers == [(_as_address(direct_owner), MIN_BOND_ATOMS)]
 
 
@@ -348,10 +357,10 @@ def test_join_entropy_refunds_value_when_validation_fails(direct_deploy, direct_
     direct_vm.sender = direct_bob  # not the designated entropy partner
     direct_vm.value = MIN_BOND_ATOMS
     try:
-        with direct_vm.expect_revert("only designated entropy partner may join"):
-            contract.join_entropy(batch_id, commitment_of("x", "irrelevant", "partner"))
+        joined = contract.join_entropy(batch_id, commitment_of("x", "irrelevant", "partner"))
     finally:
         direct_vm.value = 0
+    assert joined is False
     assert transfers == [(_as_address(direct_bob), MIN_BOND_ATOMS)]
 
 
@@ -368,16 +377,16 @@ def test_join_entropy_requires_exact_bond_match(direct_deploy, direct_vm, direct
     direct_vm.sender = direct_alice
     direct_vm.value = MIN_BOND_ATOMS - 1
     try:
-        with direct_vm.expect_revert("bond must exactly match"):
-            contract.join_entropy(batch_id, partner_commitment)
+        joined = contract.join_entropy(batch_id, partner_commitment)
     finally:
         direct_vm.value = 0
+    assert joined is False
     direct_vm.value = MIN_BOND_ATOMS + 1
     try:
-        with direct_vm.expect_revert("bond must exactly match"):
-            contract.join_entropy(batch_id, partner_commitment)
+        joined = contract.join_entropy(batch_id, partner_commitment)
     finally:
         direct_vm.value = 0
+    assert joined is False
 
 
 def test_settle_refunds_both_bonds_regardless_of_outcome(direct_deploy, direct_vm, direct_owner, direct_alice):
@@ -444,12 +453,12 @@ def test_resolved_assessment_cannot_be_retried(direct_deploy, direct_vm, direct_
     # tries to create a brand-new batch for the exact same manifest+rubric,
     # hoping for a better draw. This must be structurally impossible, not
     # merely discouraged.
-    with direct_vm.expect_revert("already produced a resolved result"):
-        _create_batch(
-            contract, direct_vm, direct_owner, direct_alice,
-            manifest_url, manifest_sha, item_count=1, sample_size=1, min_pass_bps=9999,
-            producer_secret="attempt-2-producer",
-        )
+    retry_batch_id, _ = _create_batch(
+        contract, direct_vm, direct_owner, direct_alice,
+        manifest_url, manifest_sha, item_count=1, sample_size=1, min_pass_bps=9999,
+        producer_secret="attempt-2-producer",
+    )
+    assert retry_batch_id == 0
 
 
 def test_retry_after_real_result_is_blocked_even_with_different_sampling_parameters(direct_deploy, direct_vm, direct_owner, direct_alice):
@@ -471,12 +480,12 @@ def test_retry_after_real_result_is_blocked_even_with_different_sampling_paramet
     contract.audit_sample(batch_id, 0)
     contract.settle(batch_id)
 
-    with direct_vm.expect_revert("already produced a resolved result"):
-        _create_batch(
-            contract, direct_vm, direct_owner, direct_alice,
-            manifest_url, manifest_sha, item_count=1, sample_size=1, min_pass_bps=1,
-            producer_secret="attempt-lower-threshold",
-        )
+    retry_batch_id, _ = _create_batch(
+        contract, direct_vm, direct_owner, direct_alice,
+        manifest_url, manifest_sha, item_count=1, sample_size=1, min_pass_bps=1,
+        producer_secret="attempt-lower-threshold",
+    )
+    assert retry_batch_id == 0
 
 
 def test_retry_must_reuse_locked_sampling_parameters_and_bond(direct_deploy, direct_vm, direct_owner, direct_alice, direct_bob):
@@ -494,12 +503,12 @@ def test_retry_must_reuse_locked_sampling_parameters_and_bond(direct_deploy, dir
     direct_vm.sender = direct_owner
     contract.cancel_unmatched(batch_id)  # unresolved, does not lock/resolve the assessment
 
-    with direct_vm.expect_revert("must reuse this assessment's locked"):
-        _create_batch(
-            contract, direct_vm, direct_owner, direct_bob,
-            manifest_url, manifest_sha, item_count=6, sample_size=4, min_pass_bps=6667,
-            producer_secret="second-attempt",
-        )
+    retry_batch_id, _ = _create_batch(
+        contract, direct_vm, direct_owner, direct_bob,
+        manifest_url, manifest_sha, item_count=6, sample_size=4, min_pass_bps=6667,
+        producer_secret="second-attempt",
+    )
+    assert retry_batch_id == 0
 
     # Reusing the exact same locked parameters succeeds.
     batch_id_2, _ = _create_batch(
@@ -533,14 +542,14 @@ def test_create_batch_rejects_reused_commitment(direct_deploy, direct_vm, direct
     direct_vm.sender = direct_owner
     direct_vm.value = MIN_BOND_ATOMS
     try:
-        with direct_vm.expect_revert("commitment already used"):
-            contract.create_batch(
-                manifest_url=manifest_url_b, manifest_sha256=manifest_sha_b, rubric=RUBRIC_TEXT,
-                entropy_partner=_as_address(direct_bob), producer_commitment=reused_commitment,
-                reveal_deadline=FUTURE_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
-            )
+        reused_batch_id = contract.create_batch(
+            manifest_url=manifest_url_b, manifest_sha256=manifest_sha_b, rubric=RUBRIC_TEXT,
+            entropy_partner=_as_address(direct_bob), producer_commitment=reused_commitment,
+            reveal_deadline=FUTURE_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
+        )
     finally:
         direct_vm.value = 0
+    assert reused_batch_id == 0
 
 
 def test_only_one_active_batch_per_assessment_at_a_time(direct_deploy, direct_vm, direct_owner, direct_alice, direct_bob):
@@ -553,12 +562,12 @@ def test_only_one_active_batch_per_assessment_at_a_time(direct_deploy, direct_vm
         manifest_url, manifest_sha, item_count=1, sample_size=1, min_pass_bps=1,
     )
     assert contract.get_batch(batch_id)["status_name"] == "OPEN"
-    with direct_vm.expect_revert("already has an active batch in progress"):
-        _create_batch(
-            contract, direct_vm, direct_owner, direct_bob,
-            manifest_url, manifest_sha, item_count=1, sample_size=1, min_pass_bps=1,
-            producer_secret="second-while-first-active",
-        )
+    second_batch_id, _ = _create_batch(
+        contract, direct_vm, direct_owner, direct_bob,
+        manifest_url, manifest_sha, item_count=1, sample_size=1, min_pass_bps=1,
+        producer_secret="second-while-first-active",
+    )
+    assert second_batch_id == 0
 
 
 # ---------------------------------------------------------------------------
@@ -695,10 +704,10 @@ def test_join_entropy_requires_designated_partner(direct_deploy, direct_vm, dire
     direct_vm.sender = direct_bob
     direct_vm.value = MIN_BOND_ATOMS
     try:
-        with direct_vm.expect_revert("only designated entropy partner may join"):
-            contract.join_entropy(batch_id, partner_commitment)
+        joined = contract.join_entropy(batch_id, partner_commitment)
     finally:
         direct_vm.value = 0
+    assert joined is False
 
 
 def test_join_entropy_twice_is_rejected(direct_deploy, direct_vm, direct_owner, direct_alice):
@@ -715,10 +724,10 @@ def test_join_entropy_twice_is_rejected(direct_deploy, direct_vm, direct_owner, 
     direct_vm.sender = direct_alice
     direct_vm.value = MIN_BOND_ATOMS
     try:
-        with direct_vm.expect_revert("batch is not open"):
-            contract.join_entropy(batch_id, partner_commitment_2)
+        joined = contract.join_entropy(batch_id, partner_commitment_2)
     finally:
         direct_vm.value = 0
+    assert joined is False
 
 
 def test_create_batch_rejects_self_as_entropy_partner(direct_deploy, direct_vm, direct_owner):
@@ -730,15 +739,15 @@ def test_create_batch_rejects_self_as_entropy_partner(direct_deploy, direct_vm, 
     direct_vm.sender = direct_owner
     direct_vm.value = MIN_BOND_ATOMS
     try:
-        with direct_vm.expect_revert("entropy partner must be independent"):
-            contract.create_batch(
-                manifest_url="https://fixtures.example.org/manifest-self.json",
-                manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
-                entropy_partner=_as_address(direct_owner), producer_commitment=commitment,
-                reveal_deadline=FUTURE_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
-            )
+        rejected_batch_id = contract.create_batch(
+            manifest_url="https://fixtures.example.org/manifest-self.json",
+            manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
+            entropy_partner=_as_address(direct_owner), producer_commitment=commitment,
+            reveal_deadline=FUTURE_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
+        )
     finally:
         direct_vm.value = 0
+    assert rejected_batch_id == 0
 
 
 def test_create_batch_rejects_past_deadline(direct_deploy, direct_vm, direct_owner, direct_alice):
@@ -750,15 +759,15 @@ def test_create_batch_rejects_past_deadline(direct_deploy, direct_vm, direct_own
     direct_vm.sender = direct_owner
     direct_vm.value = MIN_BOND_ATOMS
     try:
-        with direct_vm.expect_revert("reveal deadline must be in the future"):
-            contract.create_batch(
-                manifest_url="https://fixtures.example.org/manifest-past.json",
-                manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
-                entropy_partner=_as_address(direct_alice), producer_commitment=commitment,
-                reveal_deadline=PAST_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
-            )
+        rejected_batch_id = contract.create_batch(
+            manifest_url="https://fixtures.example.org/manifest-past.json",
+            manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
+            entropy_partner=_as_address(direct_alice), producer_commitment=commitment,
+            reveal_deadline=PAST_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
+        )
     finally:
         direct_vm.value = 0
+    assert rejected_batch_id == 0
 
 
 @pytest.mark.parametrize(
@@ -785,10 +794,10 @@ def test_create_batch_rejects_malformed_digests(direct_deploy, direct_vm, direct
     direct_vm.sender = direct_owner
     direct_vm.value = MIN_BOND_ATOMS
     try:
-        with direct_vm.expect_revert("must be a lowercase sha256 digest"):
-            contract.create_batch(**kwargs)
+        rejected_batch_id = contract.create_batch(**kwargs)
     finally:
         direct_vm.value = 0
+    assert rejected_batch_id == 0
 
 
 @pytest.mark.parametrize(
@@ -818,10 +827,10 @@ def test_create_batch_rejects_out_of_range_dimensions(direct_deploy, direct_vm, 
     direct_vm.sender = direct_owner
     direct_vm.value = MIN_BOND_ATOMS
     try:
-        with direct_vm.expect_revert(message):
-            contract.create_batch(**kwargs)
+        rejected_batch_id = contract.create_batch(**kwargs)
     finally:
         direct_vm.value = 0
+    assert rejected_batch_id == 0
 
 
 # ---------------------------------------------------------------------------
@@ -852,14 +861,14 @@ def test_create_batch_rejects_dangerous_manifest_urls(direct_deploy, direct_vm, 
     direct_vm.sender = direct_owner
     direct_vm.value = MIN_BOND_ATOMS
     try:
-        with direct_vm.expect_revert(message):
-            contract.create_batch(
-                manifest_url=bad_url, manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
-                entropy_partner=_as_address(direct_alice), producer_commitment=commitment,
-                reveal_deadline=FUTURE_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
-            )
+        rejected_batch_id = contract.create_batch(
+            manifest_url=bad_url, manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
+            entropy_partner=_as_address(direct_alice), producer_commitment=commitment,
+            reveal_deadline=FUTURE_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
+        )
     finally:
         direct_vm.value = 0
+    assert rejected_batch_id == 0
 
 
 def test_create_batch_accepts_ordinary_https_hostname_url(direct_deploy, direct_vm, direct_owner, direct_alice):
@@ -898,15 +907,15 @@ def test_create_batch_rejects_invalid_calendar_dates(direct_deploy, direct_vm, d
     direct_vm.sender = direct_owner
     direct_vm.value = MIN_BOND_ATOMS
     try:
-        with direct_vm.expect_revert("reveal_deadline"):
-            contract.create_batch(
-                manifest_url="https://fixtures.example.org/manifest-baddate.json",
-                manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
-                entropy_partner=_as_address(direct_alice), producer_commitment=commitment,
-                reveal_deadline=bad_deadline, item_count=1, sample_size=1, min_pass_bps=1,
-            )
+        rejected_batch_id = contract.create_batch(
+            manifest_url="https://fixtures.example.org/manifest-baddate.json",
+            manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
+            entropy_partner=_as_address(direct_alice), producer_commitment=commitment,
+            reveal_deadline=bad_deadline, item_count=1, sample_size=1, min_pass_bps=1,
+        )
     finally:
         direct_vm.value = 0
+    assert rejected_batch_id == 0
 
 
 def test_create_batch_accepts_leap_year_feb_29(direct_deploy, direct_vm, direct_owner, direct_alice):
@@ -943,15 +952,15 @@ def test_missing_transaction_timestamp_fails_closed(direct_deploy, direct_vm, di
     direct_vm.sender = direct_owner
     direct_vm.value = MIN_BOND_ATOMS
     try:
-        with direct_vm.expect_revert("transaction timestamp unavailable"):
-            contract.create_batch(
-                manifest_url="https://fixtures.example.org/manifest-notime.json",
-                manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
-                entropy_partner=_as_address(direct_alice), producer_commitment=commitment,
-                reveal_deadline=FUTURE_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
-            )
+        rejected_batch_id = contract.create_batch(
+            manifest_url="https://fixtures.example.org/manifest-notime.json",
+            manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
+            entropy_partner=_as_address(direct_alice), producer_commitment=commitment,
+            reveal_deadline=FUTURE_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
+        )
     finally:
         direct_vm.value = 0
+    assert rejected_batch_id == 0
 
 
 # ---------------------------------------------------------------------------
