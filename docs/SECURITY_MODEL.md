@@ -147,6 +147,33 @@ than bonding and should replace it.
 
 ## Trust assumptions
 
+### Value is credited before the method body runs, not atomically with success
+
+Confirmed live on Studionet while testing v2: GenVM credits a payable call's
+`gl.message.value` to the receiving contract's balance as part of message
+delivery, **before** the target method's code runs, and that credit is
+**not** rolled back if the method subsequently reverts (whether via a clean
+`gl.vm.UserError` or an uncaught exception). This is unlike typical EVM
+atomic-revert semantics, where a reverted call undoes the value transfer
+along with everything else.
+
+A first version of `create_batch`/`join_entropy` in v2 did not account for
+this: a rejected call (wrong bond amount, invalid argument, anything)
+permanently stranded the caller's attached GEN in the contract, since a
+failed `create_batch` never produces a batch record to attach a refund to.
+This was found by reproducing it live, not by any test suite -- the
+direct-mode harness does not model native value movement at all (see
+`tests/direct/test_auditlot_direct.py`'s `install_transfer_recorder` helper
+and its docstring), so this class of bug is invisible to it.
+
+**Fix:** both payable methods now wrap their entire body in a try/except
+that refunds `gl.message.value` to `gl.message.sender_address` before
+re-raising any exception (see `_refund_value`, `create_batch`,
+`join_entropy`). Any integrator building their own payable GenLayer contract
+should assume the same platform behavior applies to them and adopt the same
+pattern: never assume a reverted payable call is a no-op with respect to
+value.
+
 ### Bond value is meaningful
 
 The forfeiture deterrent is only as strong as the bond itself. AuditLot does

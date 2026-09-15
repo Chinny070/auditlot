@@ -1,4 +1,4 @@
-# v0.2.0
+# v0.2.1
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 from genlayer import *
@@ -740,8 +740,49 @@ class AuditLot(gl.Contract):
             sample_indices=",".join(str(i) for i in indices),
         ).emit()
 
+    def _refund_value(self) -> None:
+        """GenVM credits gl.message.value to this contract's balance as part
+        of message delivery, before the target method body ever runs -- and
+        that credit is NOT rolled back if the method subsequently reverts
+        (confirmed live on Studionet: a rejected create_batch call left its
+        attached value stranded in the contract with no batch ever created
+        to attach a refund to). Every payable method must therefore refund
+        whatever it received itself on any failure path, since the platform
+        will not do it automatically."""
+        value = int(gl.message.value)
+        if value > 0:
+            self._pay(gl.message.sender_address, u256(value))
+
     @gl.public.write.payable
     def create_batch(
+        self,
+        manifest_url: str,
+        manifest_sha256: str,
+        rubric: str,
+        entropy_partner: Address,
+        producer_commitment: str,
+        reveal_deadline: str,
+        item_count: u32,
+        sample_size: u32,
+        min_pass_bps: u32,
+    ) -> u256:
+        try:
+            return self._create_batch_impl(
+                manifest_url,
+                manifest_sha256,
+                rubric,
+                entropy_partner,
+                producer_commitment,
+                reveal_deadline,
+                item_count,
+                sample_size,
+                min_pass_bps,
+            )
+        except Exception:
+            self._refund_value()
+            raise
+
+    def _create_batch_impl(
         self,
         manifest_url: str,
         manifest_sha256: str,
@@ -869,6 +910,13 @@ class AuditLot(gl.Contract):
 
     @gl.public.write.payable
     def join_entropy(self, batch_id: u256, partner_commitment: str) -> None:
+        try:
+            self._join_entropy_impl(batch_id, partner_commitment)
+        except Exception:
+            self._refund_value()
+            raise
+
+    def _join_entropy_impl(self, batch_id: u256, partner_commitment: str) -> None:
         batch = self._require_batch(batch_id)
         if int(batch.status) != STATUS_OPEN:
             raise gl.vm.UserError(f"{ERR_EXPECTED}: batch is not open")

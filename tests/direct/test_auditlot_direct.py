@@ -304,6 +304,57 @@ def test_create_batch_rejects_bond_below_minimum(direct_deploy, direct_vm, direc
         direct_vm.value = 0
 
 
+def test_create_batch_refunds_value_when_a_later_validation_fails(direct_deploy, direct_vm, direct_owner, direct_alice):
+    # GenVM credits gl.message.value to the contract as part of message
+    # delivery, before the method body runs, and does NOT roll that credit
+    # back on revert (confirmed live on Studionet: a rejected create_batch
+    # call left its value permanently stranded before this fix existed).
+    # Every payable method must therefore explicitly refund on any failure
+    # path. This test attaches a valid bond but an otherwise-invalid
+    # argument (self as entropy partner) so the failure happens well after
+    # the bond-amount check, proving the refund wrapper covers the whole
+    # method body, not just the bond check itself.
+    contract = _deploy(direct_deploy)
+    items, bodies = make_items(1)
+    _, manifest_sha = canonical_manifest(items)
+    assessment_id = _assessment_id(contract, manifest_sha)
+    commitment = commitment_of("s", assessment_id, "producer")
+    transfers = install_transfer_recorder(direct_vm)
+    direct_vm.sender = direct_owner
+    direct_vm.value = MIN_BOND_ATOMS
+    try:
+        with direct_vm.expect_revert("entropy partner must be independent"):
+            contract.create_batch(
+                manifest_url="https://fixtures.example.org/manifest-refund-fail.json",
+                manifest_sha256=manifest_sha, rubric=RUBRIC_TEXT,
+                entropy_partner=_as_address(direct_owner), producer_commitment=commitment,
+                reveal_deadline=FUTURE_DEADLINE, item_count=1, sample_size=1, min_pass_bps=1,
+            )
+    finally:
+        direct_vm.value = 0
+    assert transfers == [(_as_address(direct_owner), MIN_BOND_ATOMS)]
+
+
+def test_join_entropy_refunds_value_when_validation_fails(direct_deploy, direct_vm, direct_owner, direct_alice, direct_bob):
+    contract = _deploy(direct_deploy)
+    items, bodies = make_items(1)
+    _, manifest_sha = canonical_manifest(items)
+    batch_id, _ = _create_batch(
+        contract, direct_vm, direct_owner, direct_alice,
+        "https://fixtures.example.org/manifest-join-refund.json", manifest_sha,
+        item_count=1, sample_size=1, min_pass_bps=1,
+    )
+    transfers = install_transfer_recorder(direct_vm)
+    direct_vm.sender = direct_bob  # not the designated entropy partner
+    direct_vm.value = MIN_BOND_ATOMS
+    try:
+        with direct_vm.expect_revert("only designated entropy partner may join"):
+            contract.join_entropy(batch_id, commitment_of("x", "irrelevant", "partner"))
+    finally:
+        direct_vm.value = 0
+    assert transfers == [(_as_address(direct_bob), MIN_BOND_ATOMS)]
+
+
 def test_join_entropy_requires_exact_bond_match(direct_deploy, direct_vm, direct_owner, direct_alice):
     contract = _deploy(direct_deploy)
     items, bodies = make_items(1)
