@@ -34,9 +34,18 @@ jobs:
           python-version: '3.12'
 
       - name: Install pinned tooling
+        # genvm-linter: pinned to an exact genlayerlabs/genvm-linter@main
+        # commit, not a PyPI release. Neither published PyPI release
+        # (0.10.0 or 0.11.0, checked directly against their wheels) indexes
+        # the "legacy-runners" layout that contracts/auditlot.py's pinned
+        # py-genlayer runner (1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6,
+        # a still-live, previously-deployed-and-working Studionet runner)
+        # lives under in the v0.6.0-rc1 GenVM SDK bundle; this commit does.
+        # Pinning an exact commit hash (rather than a floating branch ref)
+        # keeps this reproducible the same way a version pin would.
         run: |
           python -m pip install --upgrade pip
-          pip install genvm-linter==0.10.0 genlayer-test==0.29.2
+          pip install "git+https://github.com/genlayerlabs/genvm-linter@e94398b0fb6d012af5af6a47c43546c4913bd93e" genlayer-test==0.29.2
 
       - name: Cache GenVM SDK downloads
         uses: actions/cache@v4
@@ -72,12 +81,6 @@ jobs:
             curl -sS -L -f -o "$dest" "$url"
           fi
           ls -la "$dest"
-
-      - name: DIAGNOSTIC -- Python HOME resolution vs bash $HOME
-        run: |
-          echo "bash HOME=$HOME"
-          python3 -c "from pathlib import Path; print('Path.home()=', Path.home())"
-          python3 -c "from genvm_linter.validate.artifacts import get_cache_dir, list_cached_versions, resolve_version, get_tarball_path; d = get_cache_dir(); print('get_cache_dir()=', d); print('contents=', list(d.glob('*'))); print('list_cached_versions()=', list_cached_versions()); v = resolve_version(); print('resolve_version()=', v); p = get_tarball_path(v); print('get_tarball_path(v)=', p, 'exists=', p.exists())"
 
       - name: Repository preflight (network/syntax/secret-token checks)
         run: python scripts/preflight.py
