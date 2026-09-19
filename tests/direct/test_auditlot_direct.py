@@ -73,15 +73,16 @@ def _as_address(raw):
 
 def install_transfer_recorder(direct_vm):
     """Install a _gl_call_hook that records every PostMessage (the wire
-    format behind gl.get_contract_at(x).emit_transfer(value=...)) so bond
+    format behind the EVM-style wallet emit_transfer(value=...) as EthSend) so bond
     forfeiture/refund targeting and amounts can be asserted in direct mode,
     which does not otherwise model native GEN balance movement."""
     transfers = []
 
     def hook(vm, request):
-        if isinstance(request, dict) and "PostMessage" in request:
-            pm = request["PostMessage"]
-            transfers.append((pm.get("address"), int(pm.get("value", 0))))
+        if isinstance(request, dict):
+            if "EthSend" in request:
+                pm = request["EthSend"]
+                transfers.append((pm.get("address"), int(pm.get("value", 0))))
         return {"ok": None}
 
     direct_vm._gl_call_hook = hook

@@ -1,4 +1,4 @@
-# v0.2.2
+# v0.2.3
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 from genlayer import *
@@ -707,7 +707,7 @@ class AuditLot(gl.Contract):
     def _pay(self, to: Address, amount: u256) -> None:
         if int(amount) <= 0:
             return
-        gl.get_contract_at(to).emit_transfer(value=u256(int(amount)))
+        _Wallet(to).emit_transfer(value=u256(int(amount)))
 
     def _settle_bonds_on_abort(self, batch: Batch, was_matched: bool) -> None:
         if bool(batch.bonds_settled):
@@ -1311,3 +1311,12 @@ class AuditLot(gl.Contract):
             "inconclusive_count": int(batch.inconclusive_count),
             "settled_at": str(batch.settled_at),
         }
+
+
+@gl.evm.contract_interface
+class _Wallet:
+    class View:
+        pass
+
+    class Write:
+        pass

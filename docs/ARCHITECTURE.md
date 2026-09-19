@@ -72,10 +72,14 @@ held by the contract until the batch reaches a terminal state:
 - `abort_non_reveal()` with neither side revealed, or `cancel_unmatched()`
   on a never-joined `OPEN` batch: full refund, no forfeiture.
 
-Payouts use `gl.get_contract_at(recipient).emit_transfer(value=...)`, an
-asynchronous scheduled message, not a synchronous balance mutation within
-the same call -- callers should not assume the recipient's balance has
-already moved by the time the settling transaction returns.
+Payouts use an EVM-style transfer (`gl.evm.contract_interface`, the `_Wallet`
+helper, then `.emit_transfer(value=...)`), an asynchronous scheduled message,
+not a synchronous balance mutation within the same call -- callers should not
+assume the recipient's balance has already moved by the time the settling
+transaction returns. The earlier `gl.get_contract_at(recipient).emit_transfer`
+form only delivers to GenVM contracts; live testing on Studionet showed it
+silently loses value sent to a plain wallet address, so it must not be used
+for bond payouts.
 
 ## Blind sampling
 
