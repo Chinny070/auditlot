@@ -145,6 +145,10 @@ Then deploy and execute the live matrix in `docs/LIVE_TEST_PLAN.md` from Studio.
 
 ### Live on Studionet
 
+Current contract (v0.2.3): `0xb5FBe4396d38DeC89aC0bA9712E4Eaf0e17bE714` on Studionet (chain 61999). The live acceptance matrix (certified, rejected, inconclusive, wrong secret, replays, 10-of-10 sampling, non-reveal forfeiture, and the retry cap) was executed against it; every transaction hash is in `docs/DEPLOYMENT_EVIDENCE.md`.
+
+Two things to know when deploying yourself: `genlayer deploy` takes no `--args` for this contract (passing `--args '[]'` sends a stray argument and the constructor crashes, even though the deploy transaction still shows as agreed), and the `genlayer` CLI cannot attach value to a write call, so the payable methods (`create_batch`, `join_entropy`) must be called through the official `genlayer-js` SDK.
+
 See `docs/DEPLOYMENT_EVIDENCE.md`, which clearly separates the superseded v1 deployment (the pre-fairness-redesign contract; do not use) from the current v2 deployment evidence.
 
 ## Security boundaries

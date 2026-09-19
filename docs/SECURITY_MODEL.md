@@ -188,6 +188,15 @@ raising. Because the call then completes successfully from GenVM's
 perspective, the refund is a normal side effect of a *successful* call and
 is not rolled back.
 
+**Payout mechanism (also found live):** refunds and forfeitures must be sent
+with the EVM-style transfer (`gl.evm.contract_interface` then
+`emit_transfer`), not `gl.get_contract_at(addr).emit_transfer`. The latter
+only delivers value to GenVM contracts: sent to a plain wallet it produced an
+`ERROR` (`contract_not_found_handler`, `value_credited: false`) and the value
+was lost. The refund is delivered by a follow-up message that runs after the
+original transaction finalizes, so balances move on finalization, not on the
+first acceptance.
+
 This is a real, integrator-facing behavior change: callers of these two
 methods must check the return value (or listen for the `*Rejected` event),
 not rely on the call reverting, to detect rejection. Every other write
