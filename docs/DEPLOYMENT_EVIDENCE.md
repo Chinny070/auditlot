@@ -16,11 +16,11 @@ fairness guarantee.
 
 ## v2 (current) — bonded, assessment-locked fairness redesign
 
-- **Contract address:** `TODO` -- not yet deployed as of this revision.
-- **Deployment transaction:** `TODO`
+- **Contract address:** `0xb5FBe4396d38DeC89aC0bA9712E4Eaf0e17bE714` (Studionet, chain 61999, contract version v0.2.3)
+- **Deployment transaction:** `0xc34651a1f676639597221a107dfa71edc1a40a717608231dad19c31b97d3628b`
 - **Deployment finalized:** `TODO`
-- **Source commit deployed:** `TODO` (fill with the exact commit SHA of `contracts/auditlot.py` that was deployed)
-- **Deployer:** `TODO`
+- **Source commit deployed:** `117da9d`
+- **Deployer:** `0x3A3168d67A110dE79461939047a8f7334ff1423d`
 - **Entropy partner account(s) used:** `TODO`
 
 Deployment is gated on: the revised design passing all tests and CI (done —
@@ -30,7 +30,9 @@ wallet owner, per this task's instructions. See the final report in this
 session for what is pending.
 
 ### A. Deployment
-- `TODO`
+- Verified: `genlayer schema` returns the contract's methods. (Two earlier attempts today only looked successful: a bad `--args '[]'` made the constructor crash, so no contract existed.)
+- Refund check, verified live: a deliberately invalid `create_batch` with 1000 atoms attached (tx `0xb6ade7490060de40d61a5c02f8eb8798ee1a3346f9711b06f3793b73525538d6`) returned the sentinel, and after finalization the caller's balance was back to exactly its starting value and the contract balance was 0. The previous contract (`0x7Da416E0...D70f`, v0.2.2) lost such refunds because it used a contract-only transfer; that deployment is superseded.
+- Not yet done: the live scenarios B-I below.
 
 ### B. Happy-path certification (CERTIFIED)
 - `TODO`
